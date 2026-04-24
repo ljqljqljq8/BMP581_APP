@@ -67,13 +67,13 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             let rxCharacteristic,
             let data = command.data(using: .utf8)
         else {
-            onLog?("Unable to send command: BLE link is not ready.")
+            onLog?("Tx failed: BLE link is not ready.")
             return
         }
 
         let writeType: CBCharacteristicWriteType = rxCharacteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         peripheral.writeValue(data, for: rxCharacteristic, type: writeType)
-        onLog?("Sent command: \(command)")
+        onLog?("Tx: \(command)")
     }
 
     private func handleCentralState() {

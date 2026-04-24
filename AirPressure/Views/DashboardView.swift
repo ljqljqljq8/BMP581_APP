@@ -1,8 +1,37 @@
 import Charts
 import SwiftUI
+import UniformTypeIdentifiers
+
+struct PressureCSVDocument: FileDocument {
+    static var readableContentTypes: [UTType] = [.pressureCSV]
+
+    let csv: String
+
+    init(csv: String) {
+        self.csv = csv
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents,
+           let csv = String(data: data, encoding: .utf8) {
+            self.csv = csv
+        } else {
+            self.csv = ""
+        }
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(csv.utf8))
+    }
+}
+
+extension UTType {
+    static let pressureCSV = UTType(filenameExtension: "csv") ?? .plainText
+}
 
 struct DashboardView: View {
     @EnvironmentObject private var appModel: AppModel
+    @State private var isExportingCSV = false
 
     var body: some View {
         NavigationStack {
@@ -17,6 +46,14 @@ struct DashboardView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Air Pressure")
+        }
+        .fileExporter(
+            isPresented: $isExportingCSV,
+            document: PressureCSVDocument(csv: appModel.csvContent),
+            contentType: .pressureCSV,
+            defaultFilename: appModel.exportFilename
+        ) { result in
+            appModel.handleExportResult(result)
         }
     }
 
@@ -77,6 +114,16 @@ struct DashboardView: View {
                 .buttonStyle(.bordered)
                 .disabled(!appModel.canControlStreaming)
             }
+
+            Button {
+                isExportingCSV = true
+            } label: {
+                Label("Save CSV", systemImage: "square.and.arrow.down")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .disabled(!appModel.canExportSamples)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
@@ -88,6 +135,10 @@ struct DashboardView: View {
             Text("Live Pressure")
                 .font(.headline)
 
+            Text(appModel.chartSummaryText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             if appModel.chartSamples.isEmpty {
                 ContentUnavailableView(
                     "No Live Data Yet",
@@ -96,17 +147,36 @@ struct DashboardView: View {
                 )
                 .frame(maxWidth: .infinity)
                 .frame(height: 220)
-            } else {
+            } else if let chartPressureDomain = appModel.chartPressureDomain {
                 Chart(appModel.chartSamples) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
-                        y: .value("Pressure (kPa)", sample.pressureKPa)
+                        y: .value("Pressure (Pa)", Double(sample.pressurePa))
                     )
-                    .interpolationMethod(.catmullRom)
+                    .interpolationMethod(.linear)
                     .foregroundStyle(.blue)
                 }
                 .frame(height: 240)
-                .chartYAxisLabel("kPa")
+                .chartYScale(domain: chartPressureDomain)
+                .chartYAxis {
+                    AxisMarks(position: .trailing, values: .automatic(desiredCount: 5)) { value in
+                        AxisGridLine()
+                        AxisTick()
+                        AxisValueLabel {
+                            if let pressure = value.as(Double.self) {
+                                Text(String(format: "%.0f", pressure))
+                            }
+                        }
+                    }
+                }
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 4)) { value in
+                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+                        AxisTick()
+                        AxisValueLabel(format: .dateTime.hour().minute().second())
+                    }
+                }
+                .chartYAxisLabel("Pa")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -119,15 +189,27 @@ struct DashboardView: View {
             Text("Device Log")
                 .font(.headline)
 
-            if appModel.recentMessages.isEmpty {
+            if appModel.logEntries.isEmpty {
                 Text("Logs from the Arduino will appear here.")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(Array(appModel.recentMessages.enumerated()), id: \.offset) { _, message in
-                    Text(message)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .font(.footnote.monospaced())
-                        .padding(.vertical, 2)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(appModel.logEntries) { entry in
+                                Text(entry.renderedText)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .font(.footnote.monospaced())
+                                    .textSelection(.enabled)
+                                    .id(entry.id)
+                            }
+                        }
+                    }
+                    .frame(height: 220)
+                    .onChange(of: appModel.logEntries.last?.id, initial: true) { _, lastID in
+                        guard let lastID else { return }
+                        proxy.scrollTo(lastID, anchor: .bottom)
+                    }
                 }
             }
         }

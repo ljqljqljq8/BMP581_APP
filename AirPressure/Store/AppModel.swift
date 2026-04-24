@@ -6,14 +6,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var samples: [PressureSample] = []
     @Published private(set) var sensorHealth: SensorHealth = .unknown
     @Published private(set) var latestPressurePa: Int?
-    @Published private(set) var recentMessages: [String] = []
+    @Published private(set) var logEntries: [DeviceLogEntry] = []
 
     let bleManager = BLEManager()
 
     private var parser = PressurePacketParser()
+    private var rawLogBuffer = ""
 
-    private let displayedSampleLimit = 600
-    private let perBatchSampleInterval: TimeInterval = 0.01
+    private let displayedChartSampleLimit = 240
+    private let logEntryLimit = 250
+    private let perBatchSampleInterval: TimeInterval = 0.05
 
     init() {
         bleManager.onStateChange = { [weak self] state in
@@ -49,8 +51,52 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    var canExportSamples: Bool {
+        !samples.isEmpty
+    }
+
     var chartSamples: [PressureSample] {
-        samples.suffix(300)
+        Array(samples.suffix(displayedChartSampleLimit))
+    }
+
+    var chartPressureDomain: ClosedRange<Double>? {
+        let visibleSamples = chartSamples
+        guard
+            let minPressure = visibleSamples.map(\.pressurePa).min(),
+            let maxPressure = visibleSamples.map(\.pressurePa).max()
+        else {
+            return nil
+        }
+
+        let span = Double(maxPressure - minPressure)
+        let padding = max(span * 0.2, 5.0)
+        return Double(minPressure) - padding ... Double(maxPressure) + padding
+    }
+
+    var chartSummaryText: String {
+        let visibleSamples = chartSamples
+
+        guard
+            let minPressure = visibleSamples.map(\.pressurePa).min(),
+            let maxPressure = visibleSamples.map(\.pressurePa).max()
+        else {
+            return "Waiting for live samples."
+        }
+
+        let span = maxPressure - minPressure
+        return "\(visibleSamples.count) points shown • range \(minPressure)-\(maxPressure) Pa • span \(span) Pa"
+    }
+
+    var exportFilename: String {
+        "air-pressure-\(Self.exportDateFormatter.string(from: Date()))"
+    }
+
+    var csvContent: String {
+        let rows = samples.map {
+            "\(Self.csvDateFormatter.string(from: $0.timestamp)),\($0.pressurePa)"
+        }
+
+        return (["time,pressure_pa"] + rows).joined(separator: "\n")
     }
 
     func connectOrScan() {
@@ -73,9 +119,23 @@ final class AppModel: ObservableObject {
         bleManager.sendCommand("C")
     }
 
+    func handleExportResult(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            appendMessage("Saved CSV: \(url.lastPathComponent)")
+        case .failure(let error):
+            appendMessage("CSV export failed: \(error.localizedDescription)")
+        }
+    }
+
     private func handleIncomingPayload(_ data: Data) {
+        logRawPayload(data)
+
         for event in parser.consume(data) {
             switch event {
+            case .sensorHealth(let health, let message):
+                sensorHealth = health
+                appendMessage(message)
             case .message(let message):
                 appendMessage(message)
             case .batch(let values, let health):
@@ -95,18 +155,49 @@ final class AppModel: ObservableObject {
         }
 
         samples.append(contentsOf: newSamples)
-        if samples.count > displayedSampleLimit {
-            samples.removeFirst(samples.count - displayedSampleLimit)
+        latestPressurePa = values.last
+
+        if health != .unknown {
+            sensorHealth = health
+        } else if sensorHealth != .error {
+            sensorHealth = .normal
+        }
+    }
+
+    private func logRawPayload(_ data: Data) {
+        guard let chunk = String(data: data, encoding: .utf8) else {
+            appendMessage("Rx: <non-UTF8 payload \(data.count) bytes>")
+            return
         }
 
-        latestPressurePa = values.last
-        sensorHealth = health
+        rawLogBuffer.append(chunk)
+
+        while let newlineRange = rawLogBuffer.range(of: "\n") {
+            let line = String(rawLogBuffer[..<newlineRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            rawLogBuffer.removeSubrange(..<newlineRange.upperBound)
+
+            guard !line.isEmpty else { continue }
+            appendMessage("Rx: \(line)")
+        }
     }
 
     private func appendMessage(_ message: String) {
-        recentMessages.insert(message, at: 0)
-        if recentMessages.count > 12 {
-            recentMessages.removeLast(recentMessages.count - 12)
+        logEntries.append(DeviceLogEntry(timestamp: Date(), message: message))
+        if logEntries.count > logEntryLimit {
+            logEntries.removeFirst(logEntries.count - logEntryLimit)
         }
     }
+
+    private static let csvDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let exportDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter
+    }()
 }
