@@ -1,31 +1,31 @@
-# AirPressure iOS App
+# BMP581_APP
 
-Minimal SwiftUI iPhone app for the `JingQiBMP` BLE pressure sensor.
+用于连接 `JingQiBMP / BMP581` 蓝牙气压板卡的 iPhone App，基于 `SwiftUI + CoreBluetooth` 实现。
 
-## What it does
+## 功能
 
-- Scans and connects to the Arduino peripheral named `JingQiBMP`
-- Uses Nordic UART Service (NUS) to send `S`, `P`, and `C`
-- Parses BLE payloads such as `B:99183,99184,99183,99185,99183|S:1`
-- Shows live pressure, sensor state, and a rolling pressure chart
+- 扫描并选择 BLE 设备连接
+- 发送 `S / P / C / BAT` 指令
+- 实时显示气压、传感器状态、电量和曲线
+- 显示 BLE 日志
+- 导出 CSV
 
-## Open in Xcode
+## 目录
 
-Open:
+- iOS 工程：`AirPressure.xcodeproj`
+- App 代码：`AirPressure/`
+- 板卡固件：`Source_Files/JingqiBMP581/JingqiBMP581.ino`
 
-- `/Users/linjingqi/Projects/Ear/Air_Pressure/AirPressure.xcodeproj`
+## 使用
 
-## Before running on iPhone
+1. 用 Xcode 打开 `AirPressure.xcodeproj`
+2. 在 `Signing & Capabilities` 中选择自己的 Team
+3. 将 `JingqiBMP581.ino` 烧录到板卡并上电
+4. 在手机 App 中点击 `Scan`，选择设备后连接
+5. 点击 `Start` 开始采集，点击 `Save CSV` 导出数据
 
-1. Select your Apple Development Team in Signing & Capabilities.
-2. If needed, change the bundle identifier from `com.linjingqi.AirPressure`.
-3. Connect your iPhone and trust the Mac if Xcode asks.
-4. Make sure Bluetooth is enabled on the phone.
+## 说明
 
-## Important note about this Mac
-
-The project file is valid and the Swift sources pass SDK type-checking, but command-line `xcodebuild` could not perform a full app build because the current Xcode installation is missing the required iOS platform component/runtime. In Xcode, you can fix that from:
-
-- `Xcode > Settings > Components`
-
-Then install the iOS platform/runtime Xcode asks for.
+- 默认 BLE 名称为 `JingQiBMP`
+- 电量查询命令为 `BAT`
+- 电量计默认按 `0x36` 的 MAX17048 / MAX17049 兼容寄存器读取

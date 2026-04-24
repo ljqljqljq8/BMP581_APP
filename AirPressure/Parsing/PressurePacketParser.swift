@@ -2,6 +2,8 @@ import Foundation
 
 enum DeviceEvent {
     case batch(values: [Int], health: SensorHealth)
+    case battery(levelPercent: Double, voltage: Double)
+    case batteryError(String)
     case sensorHealth(SensorHealth, message: String)
     case message(String)
 }
@@ -37,6 +39,33 @@ struct PressurePacketParser {
 
         if line == "BMP:ERR" {
             return [.sensorHealth(.error, message: "Sensor check failed (BMP581 not detected).")]
+        }
+
+        if line == "FG:OK" {
+            return [.message("Fuel gauge detected at 0x36.")]
+        }
+
+        if line == "FG:ERR" {
+            return [.batteryError("Fuel gauge was not detected at 0x36.")]
+        }
+
+        if line == "BAT:ERR" {
+            return [.batteryError("Battery query failed.")]
+        }
+
+        if line.hasPrefix("BAT:") {
+            let payload = line.dropFirst(4)
+            let parts = payload.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+
+            guard
+                parts.count == 2,
+                let levelPercent = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+                let voltage = Double(parts[1].trimmingCharacters(in: .whitespaces))
+            else {
+                return [.message("Ignored malformed battery packet: \(line)")]
+            }
+
+            return [.battery(levelPercent: levelPercent, voltage: voltage)]
         }
 
         guard line.hasPrefix("B:") else {

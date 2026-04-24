@@ -18,7 +18,7 @@ enum BLEConnectionState: Equatable {
         case .unauthorized:
             return "Bluetooth Permission Needed"
         case .scanning:
-            return "Scanning for JingQiBMP..."
+            return "Scanning for BLE Devices..."
         case .connecting(let name):
             return "Connecting to \(name)..."
         case .connected(let name):
@@ -27,8 +27,24 @@ enum BLEConnectionState: Equatable {
     }
 }
 
+struct BLEDiscoveredDevice: Identifiable, Equatable {
+    let id: UUID
+    let name: String
+    let identifierSuffix: String
+    let rssi: Int
+
+    var connectionLabel: String {
+        "\(name) • \(identifierSuffix)"
+    }
+
+    var detailText: String {
+        "ID \(identifierSuffix) • RSSI \(rssi) dBm"
+    }
+}
+
 final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var onStateChange: ((BLEConnectionState) -> Void)?
+    var onDiscoveredDevicesChange: (([BLEDiscoveredDevice]) -> Void)?
     var onPayload: ((Data) -> Void)?
     var onLog: ((String) -> Void)?
 
@@ -38,18 +54,67 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var txCharacteristic: CBCharacteristic?
 
     private var isScanning = false
+    private var shouldStartScanWhenReady = false
+    private var discoveredPeripheralsByID: [UUID: CBPeripheral] = [:]
+    private var discoveredDevices: [BLEDiscoveredDevice] = []
 
     func start() {
         if centralManager == nil {
             centralManager = CBCentralManager(delegate: self, queue: nil)
-        } else {
-            handleCentralState()
         }
     }
 
-    func connectOrScan() {
+    func startScan() {
+        shouldStartScanWhenReady = true
         start()
         handleCentralState()
+    }
+
+    func stopScan() {
+        shouldStartScanWhenReady = false
+
+        guard let centralManager else { return }
+
+        if isScanning {
+            isScanning = false
+            centralManager.stopScan()
+        }
+    }
+
+    func connect(to deviceID: UUID) {
+        start()
+
+        guard let centralManager else { return }
+        guard centralManager.state == .poweredOn else {
+            handleCentralState()
+            return
+        }
+
+        guard let peripheral = discoveredPeripheralsByID[deviceID] else {
+            onLog?("The selected device is no longer available. Please scan again.")
+            return
+        }
+
+        if let currentPeripheral = discoveredPeripheral,
+           currentPeripheral.identifier != peripheral.identifier,
+           currentPeripheral.state == .connected || currentPeripheral.state == .connecting {
+            onLog?("Disconnect the current device before connecting to another board.")
+            return
+        }
+
+        if isScanning {
+            isScanning = false
+            centralManager.stopScan()
+        }
+
+        shouldStartScanWhenReady = false
+        discoveredPeripheral = peripheral
+        peripheral.delegate = self
+
+        let label = connectionLabel(for: peripheral)
+        updateState(.connecting(label))
+        onLog?("Connecting to \(label)...")
+        centralManager.connect(peripheral, options: nil)
     }
 
     func disconnect() {
@@ -81,18 +146,32 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         switch centralManager.state {
         case .poweredOn:
-            scanForPeripheral()
+            if shouldStartScanWhenReady {
+                scanForPeripheral()
+            } else if discoveredPeripheral == nil {
+                updateState(.idle)
+            }
         case .unauthorized:
+            shouldStartScanWhenReady = false
+            clearDiscoveredDevices()
             updateState(.unauthorized)
         case .unsupported:
+            shouldStartScanWhenReady = false
+            clearDiscoveredDevices()
             updateState(.bluetoothUnavailable("This iPhone does not support BLE."))
         case .poweredOff:
+            shouldStartScanWhenReady = false
+            clearDiscoveredDevices()
             updateState(.bluetoothUnavailable("Bluetooth is turned off."))
         case .resetting:
+            shouldStartScanWhenReady = false
+            clearDiscoveredDevices()
             updateState(.bluetoothUnavailable("Bluetooth is resetting."))
         case .unknown:
+            clearDiscoveredDevices()
             updateState(.bluetoothUnavailable("Bluetooth state is unknown."))
         @unknown default:
+            clearDiscoveredDevices()
             updateState(.bluetoothUnavailable("Bluetooth entered an unexpected state."))
         }
     }
@@ -104,6 +183,11 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return
         }
 
+        if let peripheral = discoveredPeripheral, peripheral.state == .connected || peripheral.state == .connecting {
+            onLog?("Disconnect the current device before scanning for another board.")
+            return
+        }
+
         if isScanning {
             centralManager.stopScan()
         }
@@ -112,16 +196,55 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         rxCharacteristic = nil
         txCharacteristic = nil
         isScanning = true
+        clearDiscoveredDevices()
 
         updateState(.scanning)
-        onLog?("Scanning for BLE peripheral named \(NUSConstants.targetName)...")
-        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        onLog?("Scanning for compatible BLE peripherals...")
+        centralManager.scanForPeripherals(
+            withServices: [NUSConstants.serviceUUID],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
     }
 
     private func updateState(_ state: BLEConnectionState) {
         DispatchQueue.main.async { [onStateChange] in
             onStateChange?(state)
         }
+    }
+
+    private func publishDiscoveredDevices() {
+        let snapshot = discoveredDevices
+        DispatchQueue.main.async { [onDiscoveredDevicesChange] in
+            onDiscoveredDevicesChange?(snapshot)
+        }
+    }
+
+    private func clearDiscoveredDevices() {
+        discoveredPeripheralsByID.removeAll()
+        discoveredDevices.removeAll()
+        publishDiscoveredDevices()
+    }
+
+    private func shortIdentifier(for identifier: UUID) -> String {
+        String(identifier.uuidString.replacingOccurrences(of: "-", with: "").suffix(6)).uppercased()
+    }
+
+    private func resolvedName(for peripheral: CBPeripheral, advertisedName: String? = nil) -> String {
+        let candidate = (advertisedName ?? peripheral.name ?? NUSConstants.targetName).trimmingCharacters(in: .whitespacesAndNewlines)
+        return candidate.isEmpty ? NUSConstants.targetName : candidate
+    }
+
+    private func connectionLabel(for peripheral: CBPeripheral, advertisedName: String? = nil) -> String {
+        "\(resolvedName(for: peripheral, advertisedName: advertisedName)) • \(shortIdentifier(for: peripheral.identifier))"
+    }
+
+    private func shouldIncludePeripheral(named advertisedName: String, advertisementData: [String: Any]) -> Bool {
+        if advertisedName.localizedCaseInsensitiveContains(NUSConstants.targetName) {
+            return true
+        }
+
+        let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        return advertisedServices.contains(NUSConstants.serviceUUID)
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -131,24 +254,41 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         let advertisedName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Unknown"
 
-        guard advertisedName.localizedCaseInsensitiveContains(NUSConstants.targetName) else {
+        guard shouldIncludePeripheral(named: advertisedName, advertisementData: advertisementData) else {
             return
         }
 
-        isScanning = false
-        central.stopScan()
+        let device = BLEDiscoveredDevice(
+            id: peripheral.identifier,
+            name: resolvedName(for: peripheral, advertisedName: advertisedName),
+            identifierSuffix: shortIdentifier(for: peripheral.identifier),
+            rssi: RSSI.intValue
+        )
 
-        discoveredPeripheral = peripheral
-        peripheral.delegate = self
-        updateState(.connecting(advertisedName))
-        onLog?("Found \(advertisedName) (RSSI \(RSSI)). Connecting...")
-        central.connect(peripheral, options: nil)
+        discoveredPeripheralsByID[device.id] = peripheral
+
+        if let existingIndex = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
+            discoveredDevices[existingIndex] = device
+        } else {
+            discoveredDevices.append(device)
+            onLog?("Found \(device.connectionLabel) (\(RSSI) dBm).")
+        }
+
+        discoveredDevices.sort {
+            if $0.name == $1.name {
+                return $0.rssi > $1.rssi
+            }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        publishDiscoveredDevices()
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        let name = peripheral.name ?? NUSConstants.targetName
-        updateState(.connected(name))
-        onLog?("Connected to \(name). Discovering services...")
+        let label = connectionLabel(for: peripheral)
+        shouldStartScanWhenReady = false
+        clearDiscoveredDevices()
+        updateState(.connected(label))
+        onLog?("Connected to \(label). Discovering services...")
         peripheral.discoverServices([NUSConstants.serviceUUID])
     }
 

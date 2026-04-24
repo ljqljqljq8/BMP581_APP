@@ -3,9 +3,12 @@ import Foundation
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var connectionState: BLEConnectionState = .idle
+    @Published private(set) var discoveredDevices: [BLEDiscoveredDevice] = []
     @Published private(set) var samples: [PressureSample] = []
     @Published private(set) var sensorHealth: SensorHealth = .unknown
     @Published private(set) var latestPressurePa: Int?
+    @Published private(set) var batteryPercentage: Double?
+    @Published private(set) var batteryVoltage: Double?
     @Published private(set) var logEntries: [DeviceLogEntry] = []
 
     let bleManager = BLEManager()
@@ -20,6 +23,10 @@ final class AppModel: ObservableObject {
     init() {
         bleManager.onStateChange = { [weak self] state in
             self?.connectionState = state
+        }
+
+        bleManager.onDiscoveredDevicesChange = { [weak self] devices in
+            self?.discoveredDevices = devices
         }
 
         bleManager.onPayload = { [weak self] data in
@@ -43,8 +50,26 @@ final class AppModel: ObservableObject {
         return String(format: "%.3f kPa", Double(latestPressurePa) / 1000.0)
     }
 
+    var batteryStatusText: String {
+        guard let batteryPercentage else { return "--" }
+
+        if let batteryVoltage {
+            return String(format: "%.1f%% / %.3f V", batteryPercentage, batteryVoltage)
+        }
+
+        return String(format: "%.1f%%", batteryPercentage)
+    }
+
     var canControlStreaming: Bool {
         if case .connected = connectionState {
+            return true
+        }
+
+        return false
+    }
+
+    var isScanningForDevices: Bool {
+        if case .scanning = connectionState {
             return true
         }
 
@@ -88,7 +113,7 @@ final class AppModel: ObservableObject {
         }
 
         let span = maxPressure - minPressure
-        return "\(visibleSamples.count) points shown • range \(minPressure)-\(maxPressure) Pa • span \(span) Pa"
+        return "\(visibleSamples.count) pts • \(minPressure)-\(maxPressure) Pa • span \(span) Pa"
     }
 
     var exportFilename: String {
@@ -113,8 +138,16 @@ final class AppModel: ObservableObject {
         return (["time,pressure_pa,delta_from_previous_ms"] + rows).joined(separator: "\n")
     }
 
-    func connectOrScan() {
-        bleManager.connectOrScan()
+    func startDeviceScan() {
+        bleManager.startScan()
+    }
+
+    func stopDeviceScan() {
+        bleManager.stopScan()
+    }
+
+    func connect(to deviceID: UUID) {
+        bleManager.connect(to: deviceID)
     }
 
     func disconnect() {
@@ -133,11 +166,17 @@ final class AppModel: ObservableObject {
         bleManager.sendCommand("C")
     }
 
+    func sendBatteryQuery() {
+        bleManager.sendCommand("BAT")
+    }
+
     func clearCapturedData() {
         samples.removeAll(keepingCapacity: true)
         logEntries.removeAll(keepingCapacity: true)
         latestPressurePa = nil
         sensorHealth = .unknown
+        batteryPercentage = nil
+        batteryVoltage = nil
         rawLogBuffer = ""
     }
 
@@ -155,6 +194,13 @@ final class AppModel: ObservableObject {
 
         for event in parser.consume(data) {
             switch event {
+            case .battery(let levelPercent, let voltage):
+                batteryPercentage = levelPercent
+                batteryVoltage = voltage
+            case .batteryError(let message):
+                batteryPercentage = nil
+                batteryVoltage = nil
+                appendMessage(message)
             case .sensorHealth(let health, let message):
                 sensorHealth = health
                 appendMessage(message)
