@@ -55,6 +55,10 @@ final class AppModel: ObservableObject {
         !samples.isEmpty
     }
 
+    var canClearCapturedData: Bool {
+        !samples.isEmpty || !logEntries.isEmpty || latestPressurePa != nil
+    }
+
     var chartSamples: [PressureSample] {
         Array(samples.suffix(displayedChartSampleLimit))
     }
@@ -92,11 +96,21 @@ final class AppModel: ObservableObject {
     }
 
     var csvContent: String {
-        let rows = samples.map {
-            "\(Self.csvDateFormatter.string(from: $0.timestamp)),\($0.pressurePa)"
+        let rows = samples.enumerated().map { index, sample in
+            let deltaMS: String
+
+            if index == 0 {
+                deltaMS = ""
+            } else {
+                let previousSample = samples[index - 1]
+                let delta = sample.timestamp.timeIntervalSince(previousSample.timestamp) * 1000.0
+                deltaMS = String(Int(delta.rounded()))
+            }
+
+            return "\(Self.csvDateFormatter.string(from: sample.timestamp)),\(sample.pressurePa),\(deltaMS)"
         }
 
-        return (["time,pressure_pa"] + rows).joined(separator: "\n")
+        return (["time,pressure_pa,delta_from_previous_ms"] + rows).joined(separator: "\n")
     }
 
     func connectOrScan() {
@@ -117,6 +131,14 @@ final class AppModel: ObservableObject {
 
     func sendCheck() {
         bleManager.sendCommand("C")
+    }
+
+    func clearCapturedData() {
+        samples.removeAll(keepingCapacity: true)
+        logEntries.removeAll(keepingCapacity: true)
+        latestPressurePa = nil
+        sensorHealth = .unknown
+        rawLogBuffer = ""
     }
 
     func handleExportResult(_ result: Result<URL, Error>) {

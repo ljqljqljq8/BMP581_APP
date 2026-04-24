@@ -32,6 +32,10 @@ extension UTType {
 struct DashboardView: View {
     @EnvironmentObject private var appModel: AppModel
     @State private var isExportingCSV = false
+    private let controlColumns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
 
     var body: some View {
         NavigationStack {
@@ -78,48 +82,47 @@ struct DashboardView: View {
             Text("Controls")
                 .font(.headline)
 
-            HStack(spacing: 12) {
+            LazyVGrid(columns: controlColumns, spacing: 12) {
                 Button(action: appModel.connectOrScan) {
-                    Label("Scan & Connect", systemImage: "dot.radiowaves.left.and.right")
-                        .frame(maxWidth: .infinity)
+                    controlButtonLabel(title: "Connect", systemImage: "dot.radiowaves.left.and.right")
                 }
                 .buttonStyle(.borderedProminent)
 
                 Button(action: appModel.disconnect) {
-                    Label("Disconnect", systemImage: "xmark.circle")
-                        .frame(maxWidth: .infinity)
+                    controlButtonLabel(title: "Disconnect", systemImage: "xmark.circle")
                 }
                 .buttonStyle(.bordered)
-            }
-
-            HStack(spacing: 12) {
+                
                 Button(action: appModel.sendStart) {
-                    Label("Start", systemImage: "play.fill")
-                        .frame(maxWidth: .infinity)
+                    controlButtonLabel(title: "Start", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!appModel.canControlStreaming)
 
                 Button(action: appModel.sendPause) {
-                    Label("Pause", systemImage: "pause.fill")
-                        .frame(maxWidth: .infinity)
+                    controlButtonLabel(title: "Pause", systemImage: "pause.fill")
                 }
                 .buttonStyle(.bordered)
                 .disabled(!appModel.canControlStreaming)
 
                 Button(action: appModel.sendCheck) {
-                    Label("Check", systemImage: "stethoscope")
-                        .frame(maxWidth: .infinity)
+                    controlButtonLabel(title: "Check", systemImage: "stethoscope")
                 }
                 .buttonStyle(.bordered)
                 .disabled(!appModel.canControlStreaming)
+
+                Button(action: appModel.clearCapturedData) {
+                    controlButtonLabel(title: "Clear", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .disabled(!appModel.canClearCapturedData)
             }
 
             Button {
                 isExportingCSV = true
             } label: {
-                Label("Save CSV", systemImage: "square.and.arrow.down")
-                    .frame(maxWidth: .infinity)
+                controlButtonLabel(title: "Save CSV", systemImage: "square.and.arrow.down")
             }
             .buttonStyle(.borderedProminent)
             .tint(.green)
@@ -228,6 +231,13 @@ struct DashboardView: View {
                 .minimumScaleFactor(0.7)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func controlButtonLabel(title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.headline)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, minHeight: 52)
     }
 
     private var statusIcon: String {
