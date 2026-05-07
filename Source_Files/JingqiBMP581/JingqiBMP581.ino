@@ -15,16 +15,28 @@ const float MAX_VALID_PRESSURE_PA = 125000.0f;
 
 const bool AUTO_START_STREAM = false;
 const bool ENABLE_BLE_OUTPUT = true;
+const bool ENABLE_SERIAL_DIAGNOSTIC_STREAM = true;
 
 const size_t SAMPLE_BUFFER_DEPTH = 64;
 const size_t BLE_MAX_BATCH_SAMPLES = 5;
 const size_t BLE_TEXT_PAYLOAD_LIMIT = 20;
 const uint32_t BLE_BATCH_FLUSH_TIMEOUT_MS = 250;
+const uint32_t BLE_TEMPERATURE_SEND_INTERVAL_MS = 1000;
 const uint32_t STATS_PRINT_INTERVAL_MS = 1000;
 
 struct PressureSample {
   uint32_t tickMs;
   int32_t pressurePa;
+};
+
+struct DiagnosticWindow {
+  float minPressurePa;
+  float maxPressurePa;
+  float sumPressurePa;
+  float minTempC;
+  float maxTempC;
+  float sumTempC;
+  uint32_t sampleCount;
 };
 
 DFRobot_BMP58X_I2C bmp58x(&Wire, BMP581_ADDR);
@@ -54,16 +66,27 @@ volatile uint32_t lastSampleTickMs = 0;
 volatile uint32_t lastSampleIntervalMs = 0;
 volatile uint32_t lastReadDurationUs = 0;
 volatile int32_t lastPressurePa = 0;
+volatile float lastRawPressurePa = 0.0f;
+volatile float lastTemperatureC = NAN;
+volatile uint16_t lastIntStatus = 0;
+volatile int32_t lastPressureQuantizationMilliPa = 0;
+volatile uint32_t dataReadySeenTotal = 0;
+volatile uint32_t dataReadyMissingTotal = 0;
+
+DiagnosticWindow diagnosticWindow = {NAN, NAN, 0.0f, NAN, NAN, 0.0f, 0};
 
 uint32_t sentPacketsTotal = 0;
 uint32_t sentValuesTotal = 0;
 uint32_t lastBleDurationUs = 0;
+uint32_t lastTemperatureBleSendMs = 0;
 uint32_t lastStatsPrintMs = 0;
 uint32_t lastProducedReport = 0;
 uint32_t lastDroppedReport = 0;
 uint32_t lastInvalidReport = 0;
 uint32_t lastPacketsReport = 0;
 uint32_t lastValuesReport = 0;
+uint32_t lastDataReadySeenReport = 0;
+uint32_t lastDataReadyMissingReport = 0;
 
 bool isValidPressure(float pressure) {
   if (isnan(pressure)) {
@@ -75,8 +98,62 @@ bool isValidPressure(float pressure) {
   return true;
 }
 
-bool streamActive() {
+bool isValidTemperature(float temperatureC) {
+  if (isnan(temperatureC)) {
+    return false;
+  }
+  if (temperatureC < -40.0f || temperatureC > 85.0f) {
+    return false;
+  }
+  return true;
+}
+
+bool bleStreamActive() {
   return AUTO_START_STREAM || (Bluefruit.connected() && isSendingData);
+}
+
+bool streamActive() {
+  return ENABLE_SERIAL_DIAGNOSTIC_STREAM || bleStreamActive();
+}
+
+void resetDiagnosticWindowLocked() {
+  diagnosticWindow.minPressurePa = NAN;
+  diagnosticWindow.maxPressurePa = NAN;
+  diagnosticWindow.sumPressurePa = 0.0f;
+  diagnosticWindow.minTempC = NAN;
+  diagnosticWindow.maxTempC = NAN;
+  diagnosticWindow.sumTempC = 0.0f;
+  diagnosticWindow.sampleCount = 0;
+}
+
+void updateDiagnosticWindowLocked(float pressurePa, float tempC) {
+  if (diagnosticWindow.sampleCount == 0) {
+    diagnosticWindow.minPressurePa = pressurePa;
+    diagnosticWindow.maxPressurePa = pressurePa;
+    diagnosticWindow.minTempC = tempC;
+    diagnosticWindow.maxTempC = tempC;
+  } else {
+    if (pressurePa < diagnosticWindow.minPressurePa) {
+      diagnosticWindow.minPressurePa = pressurePa;
+    }
+    if (pressurePa > diagnosticWindow.maxPressurePa) {
+      diagnosticWindow.maxPressurePa = pressurePa;
+    }
+    if (!isnan(tempC)) {
+      if (isnan(diagnosticWindow.minTempC) || tempC < diagnosticWindow.minTempC) {
+        diagnosticWindow.minTempC = tempC;
+      }
+      if (isnan(diagnosticWindow.maxTempC) || tempC > diagnosticWindow.maxTempC) {
+        diagnosticWindow.maxTempC = tempC;
+      }
+    }
+  }
+
+  diagnosticWindow.sumPressurePa += pressurePa;
+  if (!isnan(tempC)) {
+    diagnosticWindow.sumTempC += tempC;
+  }
+  diagnosticWindow.sampleCount++;
 }
 
 void clearSampleBuffer() {
@@ -84,6 +161,7 @@ void clearSampleBuffer() {
   sampleHead = 0;
   sampleTail = 0;
   sampleCount = 0;
+  resetDiagnosticWindowLocked();
   taskEXIT_CRITICAL();
 }
 
@@ -144,6 +222,7 @@ void configureSensor() {
   bmp58x.setODR(bmp58x.eOdr20Hz);
   bmp58x.setOSR(bmp58x.eOverSampling8, bmp58x.eOverSampling16);
   bmp58x.configIIR(bmp58x.eFilter1, bmp58x.eFilter3);
+  bmp58x.setIntSource(bmp58x.eIntDataReady);
   bmp58x.setMeasureMode(bmp58x.eNormal);
 }
 
@@ -165,10 +244,17 @@ bool initSensorLocked() {
   invalidSampleCount = 0;
   clearSampleBuffer();
   lastSampleTickMs = 0;
+  lastRawPressurePa = 0.0f;
+  lastTemperatureC = NAN;
+  lastIntStatus = 0;
+  lastPressureQuantizationMilliPa = 0;
+  dataReadySeenTotal = 0;
+  dataReadyMissingTotal = 0;
 
   Serial.print("BMP581 init OK (0x47), took ");
   Serial.print(millis() - startMs);
   Serial.println(" ms");
+  Serial.println("CFG odr=20Hz osr_t=8x osr_p=16x iir_t=1 iir_p=3 int=data_ready warmup=5");
   return true;
 }
 
@@ -345,6 +431,40 @@ void runBatteryQuery() {
   }
 }
 
+void sendTemperatureIfNeeded() {
+  if (!Bluefruit.connected() || !bleuart.notifyEnabled()) {
+    return;
+  }
+
+  uint32_t nowMs = millis();
+  if (nowMs - lastTemperatureBleSendMs < BLE_TEMPERATURE_SEND_INTERVAL_MS) {
+    return;
+  }
+
+  float temperatureC = NAN;
+  taskENTER_CRITICAL();
+  temperatureC = lastTemperatureC;
+  taskEXIT_CRITICAL();
+
+  if (!isValidTemperature(temperatureC)) {
+    return;
+  }
+
+  int32_t milliC = (int32_t)(temperatureC * 1000.0f);
+  bool negative = milliC < 0;
+  long absoluteMilliC = labs(milliC);
+  long whole = absoluteMilliC / 1000;
+  long fraction = absoluteMilliC % 1000;
+
+  char packet[20];
+  snprintf(packet, sizeof(packet), "T:%s%ld.%03ld\n", negative ? "-" : "", whole, fraction);
+
+  size_t written = bleuart.write((const uint8_t *)packet, strlen(packet));
+  if (written == strlen(packet)) {
+    lastTemperatureBleSendMs = nowMs;
+  }
+}
+
 void connect_callback(uint16_t conn_handle) {
   char central_name[32] = {0};
   BLEConnection *connection = Bluefruit.Connection(conn_handle);
@@ -355,6 +475,7 @@ void connect_callback(uint16_t conn_handle) {
 
   isSendingData = AUTO_START_STREAM;
   requestSensorReset = true;
+  lastTemperatureBleSendMs = 0;
   clearSampleBuffer();
 }
 
@@ -364,6 +485,7 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 
   Serial.println("Disconnected, advertising again...");
   isSendingData = false;
+  lastTemperatureBleSendMs = 0;
   clearSampleBuffer();
 }
 
@@ -380,6 +502,7 @@ void rx_callback(uint16_t conn_handle) {
   if (cmd == "S") {
     clearSampleBuffer();
     isSendingData = true;
+    lastTemperatureBleSendMs = 0;
     Serial.print("Received S, notifyEnabled=");
     Serial.println(bleuart.notifyEnabled() ? "YES" : "NO");
   } else if (cmd == "P") {
@@ -466,11 +589,32 @@ void printStats() {
   uint32_t packets = sentPacketsTotal;
   uint32_t values = sentValuesTotal;
   size_t queued = queuedSampleCount();
+  float rawPressurePa = 0.0f;
+  float temperatureC = NAN;
+  uint16_t intStatus = 0;
+  int32_t quantizationMilliPa = 0;
+  uint32_t dataReadySeen = 0;
+  uint32_t dataReadyMissing = 0;
+  DiagnosticWindow windowSnapshot = {NAN, NAN, 0.0f, NAN, NAN, 0.0f, 0};
   uint32_t producedDelta = produced - lastProducedReport;
   uint32_t droppedDelta = dropped - lastDroppedReport;
   uint32_t invalidDelta = invalid - lastInvalidReport;
   uint32_t packetsDelta = packets - lastPacketsReport;
   uint32_t valuesDelta = values - lastValuesReport;
+
+  taskENTER_CRITICAL();
+  rawPressurePa = lastRawPressurePa;
+  temperatureC = lastTemperatureC;
+  intStatus = lastIntStatus;
+  quantizationMilliPa = lastPressureQuantizationMilliPa;
+  dataReadySeen = dataReadySeenTotal;
+  dataReadyMissing = dataReadyMissingTotal;
+  windowSnapshot = diagnosticWindow;
+  resetDiagnosticWindowLocked();
+  taskEXIT_CRITICAL();
+
+  uint32_t dataReadySeenDelta = dataReadySeen - lastDataReadySeenReport;
+  uint32_t dataReadyMissingDelta = dataReadyMissing - lastDataReadyMissingReport;
 
   if (!streamActive() && queued == 0 &&
       producedDelta == 0 && droppedDelta == 0 &&
@@ -501,6 +645,46 @@ void printStats() {
   Serial.print(lastBleDurationUs);
   Serial.print(" pressure=");
   Serial.print(pressurePa);
+  Serial.print(" raw_p=");
+  Serial.print(rawPressurePa, 3);
+  Serial.print(" q_err_mPa=");
+  Serial.print(quantizationMilliPa);
+  Serial.print(" temp_c=");
+  if (isnan(temperatureC)) {
+    Serial.print("nan");
+  } else {
+    Serial.print(temperatureC, 3);
+  }
+  Serial.print(" drdy=");
+  Serial.print(dataReadySeenDelta);
+  Serial.print("/s nodr=");
+  Serial.print(dataReadyMissingDelta);
+  Serial.print("/s istat=0x");
+  Serial.print(intStatus, HEX);
+  if (windowSnapshot.sampleCount > 0) {
+    float avgPressurePa = windowSnapshot.sumPressurePa / (float)windowSnapshot.sampleCount;
+    float avgTempC = windowSnapshot.sumTempC / (float)windowSnapshot.sampleCount;
+    Serial.print(" p_range=");
+    Serial.print(windowSnapshot.minPressurePa, 3);
+    Serial.print("..");
+    Serial.print(windowSnapshot.maxPressurePa, 3);
+    Serial.print(" p_avg=");
+    Serial.print(avgPressurePa, 3);
+    Serial.print(" t_range=");
+    if (isnan(windowSnapshot.minTempC) || isnan(windowSnapshot.maxTempC)) {
+      Serial.print("nan..nan");
+    } else {
+      Serial.print(windowSnapshot.minTempC, 3);
+      Serial.print("..");
+      Serial.print(windowSnapshot.maxTempC, 3);
+    }
+    Serial.print(" t_avg=");
+    if (isnan(avgTempC)) {
+      Serial.print("nan");
+    } else {
+      Serial.print(avgTempC, 3);
+    }
+  }
   Serial.print(" sample_runs=");
   Serial.println(sampleRuns);
 
@@ -509,6 +693,8 @@ void printStats() {
   lastInvalidReport = invalid;
   lastPacketsReport = packets;
   lastValuesReport = values;
+  lastDataReadySeenReport = dataReadySeen;
+  lastDataReadyMissingReport = dataReadyMissing;
 }
 
 void sampleTaskLoop() {
@@ -539,9 +725,24 @@ void sampleTaskLoop() {
     lastSampleTickMs = tickMs;
 
     uint32_t readStartUs = micros();
+    uint16_t intStatus = bmp58x.getIntStatus();
     float pressure = bmp58x.readPressPa();
+    float temperatureC = bmp58x.readTempC();
     lastReadDurationUs = micros() - readStartUs;
     xSemaphoreGive(sensorMutex);
+
+    taskENTER_CRITICAL();
+    lastIntStatus = intStatus;
+    lastRawPressurePa = pressure;
+    if (isValidTemperature(temperatureC)) {
+      lastTemperatureC = temperatureC;
+    }
+    if (intStatus & bmp58x.eIntStatusDataReady) {
+      dataReadySeenTotal++;
+    } else {
+      dataReadyMissingTotal++;
+    }
+    taskEXIT_CRITICAL();
 
     if (warmupSamplesRemaining > 0) {
       warmupSamplesRemaining--;
@@ -560,10 +761,17 @@ void sampleTaskLoop() {
 
     invalidSampleCount = 0;
 
+    taskENTER_CRITICAL();
+    updateDiagnosticWindowLocked(pressure, isValidTemperature(temperatureC) ? temperatureC : NAN);
+    lastPressureQuantizationMilliPa = (int32_t)((pressure - (float)((int32_t)pressure)) * 1000.0f);
+    taskEXIT_CRITICAL();
+
     PressureSample sample = {tickMs, (int32_t)pressure};
     lastPressurePa = sample.pressurePa;
     producedSamplesTotal++;
-    pushSample(sample);
+    if (bleStreamActive()) {
+      pushSample(sample);
+    }
   }
 }
 
@@ -609,7 +817,7 @@ void loop() {
     runBatteryQuery();
   }
 
-  if (ENABLE_BLE_OUTPUT && streamActive() && bleuart.notifyEnabled()) {
+  if (ENABLE_BLE_OUTPUT && bleStreamActive() && bleuart.notifyEnabled()) {
     PressureSample samples[BLE_MAX_BATCH_SAMPLES];
     size_t available = peekSamples(samples, BLE_MAX_BATCH_SAMPLES);
 
@@ -637,6 +845,8 @@ void loop() {
         }
       }
     }
+
+    sendTemperatureIfNeeded();
   }
 
   printStats();

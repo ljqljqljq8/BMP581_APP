@@ -2,6 +2,7 @@ import Foundation
 
 enum DeviceEvent {
     case batch(values: [Int], health: SensorHealth)
+    case temperature(Double)
     case battery(levelPercent: Double, voltage: Double)
     case batteryError(String)
     case sensorHealth(SensorHealth, message: String)
@@ -66,6 +67,16 @@ struct PressurePacketParser {
             }
 
             return [.battery(levelPercent: levelPercent, voltage: voltage)]
+        }
+
+        if line.hasPrefix("T:") {
+            let payload = line.dropFirst(2).trimmingCharacters(in: .whitespaces)
+
+            guard let temperatureC = Double(payload) else {
+                return [.message("Ignored malformed temperature packet: \(line)")]
+            }
+
+            return [.temperature(temperatureC)]
         }
 
         guard line.hasPrefix("B:") else {

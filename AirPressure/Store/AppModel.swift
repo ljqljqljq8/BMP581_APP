@@ -5,6 +5,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var connectionState: BLEConnectionState = .idle
     @Published private(set) var discoveredDevices: [BLEDiscoveredDevice] = []
     @Published private(set) var samples: [PressureSample] = []
+    @Published private(set) var temperatureSamples: [TemperatureSample] = []
     @Published private(set) var sensorHealth: SensorHealth = .unknown
     @Published private(set) var latestPressurePa: Int?
     @Published private(set) var batteryPercentage: Double?
@@ -19,6 +20,10 @@ final class AppModel: ObservableObject {
     private let displayedChartSampleLimit = 240
     private let logEntryLimit = 250
     private let perBatchSampleInterval: TimeInterval = 0.05
+    private let displayedChartTemperatureSampleLimit = 240
+    private let validTemperatureRange = -40.0 ... 85.0
+    private let maxAcceptedTemperatureJumpC = 5.0
+    private let maxAcceptedTemperatureJumpInterval: TimeInterval = 5.0
 
     init() {
         bleManager.onStateChange = { [weak self] state in
@@ -81,15 +86,58 @@ final class AppModel: ObservableObject {
     }
 
     var canClearCapturedData: Bool {
-        !samples.isEmpty || !logEntries.isEmpty || latestPressurePa != nil
+        !samples.isEmpty || !temperatureSamples.isEmpty || !logEntries.isEmpty || latestPressurePa != nil
     }
 
     var chartSamples: [PressureSample] {
         Array(samples.suffix(displayedChartSampleLimit))
     }
 
+    var plottedChartSamples: [PressureSample] {
+        chartSamples.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    var chartTemperatureSamples: [TemperatureSample] {
+        let visibleTemperatureSamples = Array(temperatureSamples.suffix(displayedChartTemperatureSampleLimit))
+
+        guard
+            let startDate = chartPressureTimeDomain?.lowerBound,
+            let endDate = chartPressureTimeDomain?.upperBound
+        else {
+            return visibleTemperatureSamples
+        }
+
+        return visibleTemperatureSamples.filter { sample in
+            sample.timestamp >= startDate && sample.timestamp <= endDate
+        }
+    }
+
+    var plottedChartTemperatureSamples: [TemperatureSample] {
+        chartTemperatureSamples.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    var chartTimeDomain: ClosedRange<Date>? {
+        if let chartPressureTimeDomain {
+            return chartPressureTimeDomain
+        }
+
+        if let first = plottedChartTemperatureSamples.first?.timestamp, let last = plottedChartTemperatureSamples.last?.timestamp {
+            return first ... last
+        }
+
+        return nil
+    }
+
+    private var chartPressureTimeDomain: ClosedRange<Date>? {
+        guard let first = plottedChartSamples.first?.timestamp, let last = plottedChartSamples.last?.timestamp else {
+            return nil
+        }
+
+        return first ... last
+    }
+
     var chartPressureDomain: ClosedRange<Double>? {
-        let visibleSamples = chartSamples
+        let visibleSamples = plottedChartSamples
         guard
             let minPressure = visibleSamples.map(\.pressurePa).min(),
             let maxPressure = visibleSamples.map(\.pressurePa).max()
@@ -102,8 +150,40 @@ final class AppModel: ObservableObject {
         return Double(minPressure) - padding ... Double(maxPressure) + padding
     }
 
+    var chartTemperatureDomain: ClosedRange<Double>? {
+        let visibleSamples = plottedChartTemperatureSamples
+        guard
+            let minTemperature = visibleSamples.map(\.temperatureC).min(),
+            let maxTemperature = visibleSamples.map(\.temperatureC).max()
+        else {
+            return nil
+        }
+
+        let span = maxTemperature - minTemperature
+        let padding = max(span * 0.2, 0.2)
+        return (minTemperature - padding) ... (maxTemperature + padding)
+    }
+
+    var chartTemperatureAxisTicks: [(plotValue: Double, temperatureC: Double)] {
+        guard
+            let temperatureDomain = chartTemperatureDomain,
+            let pressureDomain = chartPressureDomain
+        else {
+            return []
+        }
+
+        let tickCount = 4
+        let temperatureSpan = temperatureDomain.upperBound - temperatureDomain.lowerBound
+
+        return (0..<tickCount).map { index in
+            let ratio = tickCount == 1 ? 0.0 : Double(index) / Double(tickCount - 1)
+            let temperature = temperatureDomain.lowerBound + (temperatureSpan * ratio)
+            return (plotValue: mapTemperatureToPressureAxis(temperature, temperatureDomain: temperatureDomain, pressureDomain: pressureDomain), temperatureC: temperature)
+        }
+    }
+
     var chartSummaryText: String {
-        let visibleSamples = chartSamples
+        let visibleSamples = plottedChartSamples
 
         guard
             let minPressure = visibleSamples.map(\.pressurePa).min(),
@@ -113,6 +193,13 @@ final class AppModel: ObservableObject {
         }
 
         let span = maxPressure - minPressure
+        if
+            let minTemperature = plottedChartTemperatureSamples.map(\.temperatureC).min(),
+            let maxTemperature = plottedChartTemperatureSamples.map(\.temperatureC).max()
+        {
+            return "\(visibleSamples.count) pts • \(minPressure)-\(maxPressure) Pa • span \(span) Pa • \(String(format: "%.1f", minTemperature))-\(String(format: "%.1f", maxTemperature)) °C"
+        }
+
         return "\(visibleSamples.count) pts • \(minPressure)-\(maxPressure) Pa • span \(span) Pa"
     }
 
@@ -172,6 +259,7 @@ final class AppModel: ObservableObject {
 
     func clearCapturedData() {
         samples.removeAll(keepingCapacity: true)
+        temperatureSamples.removeAll(keepingCapacity: true)
         logEntries.removeAll(keepingCapacity: true)
         latestPressurePa = nil
         sensorHealth = .unknown
@@ -194,6 +282,8 @@ final class AppModel: ObservableObject {
 
         for event in parser.consume(data) {
             switch event {
+            case .temperature(let temperatureC):
+                ingestTemperature(temperatureC)
             case .battery(let levelPercent, let voltage):
                 batteryPercentage = levelPercent
                 batteryVoltage = voltage
@@ -232,6 +322,31 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func ingestTemperature(_ temperatureC: Double) {
+        guard validTemperatureRange.contains(temperatureC) else {
+            appendMessage("Ignored invalid temperature sample: \(String(format: "%.3f", temperatureC)) °C")
+            return
+        }
+
+        if let lastSample = temperatureSamples.last {
+            let deltaT = Date().timeIntervalSince(lastSample.timestamp)
+            let deltaC = abs(temperatureC - lastSample.temperatureC)
+            if deltaT <= maxAcceptedTemperatureJumpInterval, deltaC > maxAcceptedTemperatureJumpC {
+                appendMessage(
+                    "Ignored temperature outlier: \(String(format: "%.3f", temperatureC)) °C after \(String(format: "%.3f", lastSample.temperatureC)) °C"
+                )
+                return
+            }
+        }
+
+        temperatureSamples.append(TemperatureSample(timestamp: Date(), temperatureC: temperatureC))
+
+        let overflow = temperatureSamples.count - displayedChartTemperatureSampleLimit
+        if overflow > 0 {
+            temperatureSamples.removeFirst(overflow)
+        }
+    }
+
     private func logRawPayload(_ data: Data) {
         guard let chunk = String(data: data, encoding: .utf8) else {
             appendMessage("Rx: <non-UTF8 payload \(data.count) bytes>")
@@ -254,6 +369,49 @@ final class AppModel: ObservableObject {
         if logEntries.count > logEntryLimit {
             logEntries.removeFirst(logEntries.count - logEntryLimit)
         }
+    }
+
+    func chartPlotValue(for temperatureC: Double) -> Double? {
+        guard
+            let temperatureDomain = chartTemperatureDomain,
+            let pressureDomain = chartPressureDomain
+        else {
+            return nil
+        }
+
+        return mapTemperatureToPressureAxis(
+            temperatureC,
+            temperatureDomain: temperatureDomain,
+            pressureDomain: pressureDomain
+        )
+    }
+
+    func chartTemperatureLabel(for plotValue: Double) -> String? {
+        let matchingTick = chartTemperatureAxisTicks.min { lhs, rhs in
+            abs(lhs.plotValue - plotValue) < abs(rhs.plotValue - plotValue)
+        }
+
+        guard let matchingTick, abs(matchingTick.plotValue - plotValue) < 0.001 else {
+            return nil
+        }
+
+        return String(format: "%.1f", matchingTick.temperatureC)
+    }
+
+    private func mapTemperatureToPressureAxis(
+        _ temperatureC: Double,
+        temperatureDomain: ClosedRange<Double>,
+        pressureDomain: ClosedRange<Double>
+    ) -> Double {
+        let temperatureSpan = temperatureDomain.upperBound - temperatureDomain.lowerBound
+        let pressureSpan = pressureDomain.upperBound - pressureDomain.lowerBound
+
+        if temperatureSpan == 0 {
+            return (pressureDomain.lowerBound + pressureDomain.upperBound) * 0.5
+        }
+
+        let ratio = (temperatureC - temperatureDomain.lowerBound) / temperatureSpan
+        return pressureDomain.lowerBound + (pressureSpan * ratio)
     }
 
     private static let csvDateFormatter: ISO8601DateFormatter = {

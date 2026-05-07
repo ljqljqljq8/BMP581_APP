@@ -10,6 +10,12 @@ struct PressureSample: Identifiable {
     }
 }
 
+struct TemperatureSample: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let temperatureC: Double
+}
+
 struct DeviceLogEntry: Identifiable {
     let id = UUID()
     let timestamp: Date

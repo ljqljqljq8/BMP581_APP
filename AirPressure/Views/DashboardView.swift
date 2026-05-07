@@ -33,6 +33,8 @@ struct DashboardView: View {
     @EnvironmentObject private var appModel: AppModel
     @State private var isExportingCSV = false
     @State private var isShowingDevicePicker = false
+    private let pressureLineColor = Color(red: 0.14, green: 0.42, blue: 0.80)
+    private let temperatureLineColor = Color(red: 0.88, green: 0.47, blue: 0.15)
     private let statusColumns = [
         GridItem(.flexible(), spacing: 12),
         GridItem(.flexible(), spacing: 12),
@@ -204,41 +206,29 @@ struct DashboardView: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: 230)
             } else if let chartPressureDomain = appModel.chartPressureDomain {
-                Chart(appModel.chartSamples) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Pressure (Pa)", Double(sample.pressurePa))
-                    )
-                    .interpolationMethod(.linear)
-                    .foregroundStyle(Color(red: 0.14, green: 0.42, blue: 0.80))
-                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                }
-                .frame(height: 260)
-                .chartYScale(domain: chartPressureDomain)
-                .chartPlotStyle { plot in
-                    plot
-                        .background(Color.clear)
-                        .clipped()
-                }
-                .chartYAxis {
-                    AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) { value in
-                        AxisGridLine()
-                        AxisTick()
-                        AxisValueLabel {
-                            if let pressure = value.as(Double.self) {
-                                Text(String(format: "%.0f", pressure))
-                            }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 14) {
+                        chartLegendLabel(color: pressureLineColor, title: "Pressure")
+
+                        if !appModel.plottedChartTemperatureSamples.isEmpty {
+                            chartLegendLabel(color: temperatureLineColor, title: "Temperature")
                         }
                     }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    PressureTemperaturePlot(
+                        pressureSamples: appModel.plottedChartSamples,
+                        temperatureSamples: appModel.plottedChartTemperatureSamples,
+                        pressureDomain: chartPressureDomain,
+                        temperatureDomain: appModel.chartTemperatureDomain,
+                        timeDomain: appModel.chartTimeDomain,
+                        pressureColor: pressureLineColor,
+                        temperatureColor: temperatureLineColor
+                    )
+                    .frame(height: 260)
+                    .padding(.top, 4)
                 }
-                .chartXAxis {
-                    AxisMarks(values: .automatic(desiredCount: 3)) { value in
-                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
-                        AxisTick()
-                        AxisValueLabel(format: .dateTime.minute().second())
-                    }
-                }
-                .clipped()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -338,15 +328,27 @@ struct DashboardView: View {
     }
 
     private func discoveredDeviceRow(_ device: BLEDiscoveredDevice) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(device.connectionLabel)
-                .font(.system(.headline, design: .rounded).weight(.semibold))
-                .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(device.connectionLabel)
+                    .font(.system(.headline, design: .rounded).weight(.semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(device.detailText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(device.detailText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Text("Connect")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(Color.black)
+                )
         }
         .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
     }
@@ -363,6 +365,16 @@ struct DashboardView: View {
                 .minimumScaleFactor(0.85)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func chartLegendLabel(color: Color, title: String) -> some View {
+        HStack(spacing: 6) {
+            Capsule()
+                .fill(color)
+                .frame(width: 16, height: 4)
+
+            Text(title)
+        }
     }
 
     private var cardBackground: some View {
@@ -396,6 +408,7 @@ struct DashboardView: View {
                                 } label: {
                                     discoveredDeviceRow(device)
                                         .padding(.vertical, 4)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -406,6 +419,15 @@ struct DashboardView: View {
             }
             .navigationTitle("Select Device")
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .top) {
+                Text("Tap a board below to connect.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .background(Color(.systemBackground))
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Close") {
@@ -500,6 +522,227 @@ private enum ActionButtonStyleKind {
     case secondary
     case danger
     case success
+}
+
+private struct PressureTemperaturePlot: View {
+    let pressureSamples: [PressureSample]
+    let temperatureSamples: [TemperatureSample]
+    let pressureDomain: ClosedRange<Double>
+    let temperatureDomain: ClosedRange<Double>?
+    let timeDomain: ClosedRange<Date>?
+    let pressureColor: Color
+    let temperatureColor: Color
+
+    private let leadingAxisWidth: CGFloat = 42
+    private let trailingAxisWidth: CGFloat = 54
+    private let bottomAxisHeight: CGFloat = 28
+    private let topPadding: CGFloat = 10
+    private let horizontalTickCount = 4
+    private let verticalTickCount = 3
+
+    var body: some View {
+        GeometryReader { geometry in
+            let plotRect = CGRect(
+                x: leadingAxisWidth,
+                y: topPadding,
+                width: max(geometry.size.width - leadingAxisWidth - trailingAxisWidth, 1),
+                height: max(geometry.size.height - topPadding - bottomAxisHeight, 1)
+            )
+
+            ZStack {
+                horizontalGrid(plotRect: plotRect)
+                verticalGrid(plotRect: plotRect)
+                pressurePath(plotRect: plotRect)
+                    .stroke(pressureColor, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+
+                if !temperatureSamples.isEmpty {
+                    temperaturePath(plotRect: plotRect)
+                        .stroke(
+                            temperatureColor,
+                            style: StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round, dash: [8, 6])
+                        )
+
+                    temperatureMarkers(plotRect: plotRect)
+                }
+
+                leftAxisLabels(plotRect: plotRect)
+                rightAxisLabels(plotRect: plotRect)
+                bottomAxisLabels(plotRect: plotRect)
+            }
+        }
+    }
+
+    private func horizontalGrid(plotRect: CGRect) -> some View {
+        Canvas { context, _ in
+            guard horizontalTickCount > 1 else { return }
+
+            for index in 0..<horizontalTickCount {
+                let ratio = Double(index) / Double(horizontalTickCount - 1)
+                let y = plotRect.maxY - (plotRect.height * ratio)
+                var path = Path()
+                path.move(to: CGPoint(x: plotRect.minX, y: y))
+                path.addLine(to: CGPoint(x: plotRect.maxX, y: y))
+                context.stroke(path, with: .color(Color(.separator).opacity(0.55)), lineWidth: 1)
+            }
+        }
+    }
+
+    private func verticalGrid(plotRect: CGRect) -> some View {
+        Canvas { context, _ in
+            guard verticalTickCount > 1 else { return }
+
+            for index in 1..<(verticalTickCount - 1) {
+                let ratio = Double(index) / Double(verticalTickCount - 1)
+                let x = plotRect.minX + (plotRect.width * ratio)
+                var path = Path()
+                path.move(to: CGPoint(x: x, y: plotRect.minY))
+                path.addLine(to: CGPoint(x: x, y: plotRect.maxY))
+                context.stroke(
+                    path,
+                    with: .color(Color(.separator).opacity(0.45)),
+                    style: StrokeStyle(lineWidth: 1, dash: [3, 4])
+                )
+            }
+        }
+    }
+
+    private func pressurePath(plotRect: CGRect) -> Path {
+        guard
+            let timeDomain,
+            pressureSamples.count >= 1
+        else {
+            return Path()
+        }
+
+        var path = Path()
+
+        for (index, sample) in pressureSamples.enumerated() {
+            let point = CGPoint(
+                x: mappedX(for: sample.timestamp, in: timeDomain, plotRect: plotRect),
+                y: mappedY(for: Double(sample.pressurePa), in: pressureDomain, plotRect: plotRect)
+            )
+
+            if index == 0 {
+                path.move(to: point)
+            } else {
+                let previousSample = pressureSamples[index - 1]
+                let previousPoint = CGPoint(
+                    x: mappedX(for: previousSample.timestamp, in: timeDomain, plotRect: plotRect),
+                    y: mappedY(for: Double(previousSample.pressurePa), in: pressureDomain, plotRect: plotRect)
+                )
+                path.addLine(to: CGPoint(x: point.x, y: previousPoint.y))
+                path.addLine(to: point)
+            }
+        }
+
+        return path
+    }
+
+    private func temperaturePath(plotRect: CGRect) -> Path {
+        guard
+            let timeDomain,
+            let temperatureDomain,
+            temperatureSamples.count >= 1
+        else {
+            return Path()
+        }
+
+        var path = Path()
+
+        for (index, sample) in temperatureSamples.enumerated() {
+            let point = CGPoint(
+                x: mappedX(for: sample.timestamp, in: timeDomain, plotRect: plotRect),
+                y: mappedY(for: sample.temperatureC, in: temperatureDomain, plotRect: plotRect)
+            )
+
+            if index == 0 {
+                path.move(to: point)
+            } else {
+                path.addLine(to: point)
+            }
+        }
+
+        return path
+    }
+
+    private func leftAxisLabels(plotRect: CGRect) -> some View {
+        ZStack {
+            if let temperatureDomain {
+                ForEach(0..<horizontalTickCount, id: \.self) { index in
+                    let ratio = horizontalTickCount == 1 ? 0.0 : Double(index) / Double(horizontalTickCount - 1)
+                    let value = temperatureDomain.lowerBound + ((temperatureDomain.upperBound - temperatureDomain.lowerBound) * (1.0 - ratio))
+                    let y = plotRect.minY + (plotRect.height * ratio)
+
+                    Text(String(format: "%.1f", value))
+                        .font(.caption)
+                        .foregroundStyle(temperatureColor.opacity(0.9))
+                        .position(x: leadingAxisWidth * 0.5, y: y)
+                }
+            }
+        }
+    }
+
+    private func rightAxisLabels(plotRect: CGRect) -> some View {
+        ZStack {
+            ForEach(0..<horizontalTickCount, id: \.self) { index in
+                let ratio = horizontalTickCount == 1 ? 0.0 : Double(index) / Double(horizontalTickCount - 1)
+                let value = pressureDomain.lowerBound + ((pressureDomain.upperBound - pressureDomain.lowerBound) * (1.0 - ratio))
+                let y = plotRect.minY + (plotRect.height * ratio)
+
+                Text(String(format: "%.0f", value))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .position(x: plotRect.maxX + (trailingAxisWidth * 0.5), y: y)
+            }
+        }
+    }
+
+    private func bottomAxisLabels(plotRect: CGRect) -> some View {
+        ZStack {
+            if let timeDomain {
+                ForEach(0..<verticalTickCount, id: \.self) { index in
+                    let ratio = verticalTickCount == 1 ? 0.0 : Double(index) / Double(verticalTickCount - 1)
+                    let timestamp = timeDomain.lowerBound.addingTimeInterval(timeDomain.upperBound.timeIntervalSince(timeDomain.lowerBound) * ratio)
+                    let x = plotRect.minX + (plotRect.width * ratio)
+
+                    Text(timestamp.formatted(.dateTime.minute().second()))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .position(x: x, y: plotRect.maxY + (bottomAxisHeight * 0.55))
+                }
+            }
+        }
+    }
+
+    private func temperatureMarkers(plotRect: CGRect) -> some View {
+        ZStack {
+            if let timeDomain, let temperatureDomain {
+                ForEach(temperatureSamples) { sample in
+                    Circle()
+                        .fill(temperatureColor)
+                        .frame(width: 5, height: 5)
+                        .position(
+                            x: mappedX(for: sample.timestamp, in: timeDomain, plotRect: plotRect),
+                            y: mappedY(for: sample.temperatureC, in: temperatureDomain, plotRect: plotRect)
+                        )
+                }
+            }
+        }
+    }
+
+    private func mappedX(for timestamp: Date, in domain: ClosedRange<Date>, plotRect: CGRect) -> CGFloat {
+        let total = domain.upperBound.timeIntervalSince(domain.lowerBound)
+        guard total > 0 else { return plotRect.midX }
+        let ratio = timestamp.timeIntervalSince(domain.lowerBound) / total
+        return plotRect.minX + (plotRect.width * CGFloat(ratio))
+    }
+
+    private func mappedY(for value: Double, in domain: ClosedRange<Double>, plotRect: CGRect) -> CGFloat {
+        let span = domain.upperBound - domain.lowerBound
+        guard span > 0 else { return plotRect.midY }
+        let ratio = (value - domain.lowerBound) / span
+        return plotRect.maxY - (plotRect.height * CGFloat(ratio))
+    }
 }
 
 #Preview {
